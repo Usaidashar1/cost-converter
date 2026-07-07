@@ -269,7 +269,8 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
         for row in vm_rows:
             desc = row["desc"]
             sku = extract_vm_sku(desc)
-            sql_lbl, _, _, is_ahb = get_exact_license_name(desc)
+            # FIXED: Correctly unpack os_type instead of relying on the old detect_os function
+            sql_lbl, _, os_type, is_ahb = get_exact_license_name(desc)
             prem_kws = ["red hat", "rhel", "suse", "sles", "ubuntu pro", "ubuntu advantage"]
             has_prem = any(kw in desc.lower() for kw in prem_kws)
             
@@ -277,7 +278,7 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
                 qty = extract_quantity(desc)
                 p_usd = get_vm_pricing(session, cache, sku, row["region"], "spot" in desc.lower(), "USD")
                 usd_comp = (p_usd.get("compute_payg") or 0) * qty
-                usd_win = (p_usd.get("windows_tot") or 0) * qty if detect_os(desc) == "Windows" and not is_ahb else 0
+                usd_win = (p_usd.get("windows_tot") or 0) * qty if os_type == "Windows" and not is_ahb else 0
                 usd_tot = usd_comp + usd_win
                 orig_payg = row.get("payg", 0)
                 
@@ -369,7 +370,7 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
             row["api"] = {
                 "compute_payg_final": comp_payg,
                 "win_lic_payg_final": win_payg,
-                "prem_os_payg_final": 0, # Folded directly into compute 
+                "prem_os_payg_final": 0, 
                 "sql_payg_final": sql_payg,
                 "compute_ri1": comp_ri1,
                 "compute_ri3": comp_ri3
@@ -428,12 +429,12 @@ def write_vm_sheet(wb, rows, currency):
         ri += 1
 
         if win_payg > 0:
-            sub = ["","","","","Windows License", win_payg, win_payg, win_payg, "License Cost (Not discounted by Compute RI)"]
+            sub = ["","","","","Windows License", win_payg, win_payg, win_payg, "License Cost (Not discounted)"]
             for ci, v in enumerate(sub, 1): dat(ws.cell(ri, ci), v, currency, italic=True, color="595959", align="right" if ci>=6 and isinstance(v,float) else "left")
             ri += 1
 
         if sql_payg > 0:
-            sub = ["","","","", row.get("sql_lbl_exact", "SQL License"), sql_payg, sql_payg, sql_payg, "License Cost (Not discounted by Compute RI)"]
+            sub = ["","","","", row.get("sql_lbl_exact", "SQL License"), sql_payg, sql_payg, sql_payg, "License Cost (Not discounted)"]
             for ci, v in enumerate(sub, 1): dat(ws.cell(ri, ci), v, currency, italic=True, color="595959", align="right" if ci>=6 and isinstance(v,float) else "left")
             ri += 1
 
@@ -518,7 +519,6 @@ def convert(input_path, output_path, currency="INR"):
 
     write_summary(wb_out, totals, currency)
     
-    # EXTREMELY CRITICAL: These must be explicitly closed to clear Azure's read/write locks, preventing 409 errors
     wb_out.save(output_path)
     wb_in.close()
     wb_out.close()

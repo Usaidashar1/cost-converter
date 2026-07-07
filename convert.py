@@ -105,14 +105,19 @@ def _api(session, cache, filt, currency="INR"):
 
 def _hourly_to_monthly(price): return price * 730
 
+def extract_vcpus(desc):
+    if not desc: return None
+    m = re.search(r'\((\d+)\s*vCPU', desc, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
 def get_exact_license_name(desc):
     desc_l = desc.lower()
     parts = re.split(r'[,;]', desc)
     sql_name = os_name = None
     
     is_ahb = any(kw in desc_l for kw in ["hybrid benefit", "ahb", "bring your own license", "byol"])
-    
     prem_kws = ["red hat", "rhel", "suse", "sles", "ubuntu pro", "ubuntu advantage"]
+    
     for p in parts:
         p_lower = p.lower()
         if "sql" in p_lower:
@@ -219,7 +224,8 @@ def parse_all_formats(wb):
             return float(fallback)
 
         for r in ws.iter_rows(values_only=True):
-            if not r or r[0] is None: continue
+            if not r or len(r) < 6: continue
+            if r[0] is None: continue
             
             svc_cat_raw = str(r[0]).strip().lower()
             if svc_cat_raw == "service category":
@@ -323,48 +329,47 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
                 row["remarks"] = " | ".join(remarks)
                 return row
 
-            comp_payg, win_payg, prem_os_payg, sql_payg = orig_payg, 0, 0, 0
-
-            # --- PROPORTIONAL FX SPLIT ENGINE ---
-            if os_type == "Windows" and not is_ahb and usd_win > 0:
-                win_ratio = usd_win / (usd_comp + usd_win)
-                win_payg = orig_payg * win_ratio
-                comp_payg = orig_payg - win_payg
-            elif has_premium_os:
-                comp_payg = usd_comp * locked_fx
-                prem_os_payg = max(0, orig_payg - comp_payg)
-                # Visual Merge
-                comp_payg += prem_os_payg
-                prem_os_payg = 0 
+            pure_comp_payg = usd_comp * locked_fx
+            win_payg = usd_win * locked_fx if os_type == "Windows" and not is_ahb else 0
             
-            if has_sql:
-                if orig_payg > (comp_payg + win_payg + prem_os_payg):
-                    sql_payg = orig_payg - (comp_payg + win_payg + prem_os_payg)
-                else:
-                    sql_payg = orig_payg * 0.40
-                    comp_payg = orig_payg * 0.60
-
-            license_total = win_payg + prem_os_payg + sql_payg
+            unaccounted = orig_payg - pure_comp_payg - win_payg
             
-            # --- FLAWLESS RI COMPUTATION ---
+            hidden_os_payg = 0
+            sql_payg = 0
+            
+            if unaccounted > 5:
+                if has_sql and has_premium_os:
+                    vcpus = extract_vcpus(desc)
+                    if "suse" in desc.lower(): os_usd = 29.20 if (vcpus and vcpus <= 4) else 73.00
+                    else: os_usd = 42.05 if (vcpus and vcpus <= 4) else 94.90
+                    
+                    hidden_os_payg = os_usd * qty * locked_fx
+                    sql_payg = max(0, unaccounted - hidden_os_payg)
+                elif has_sql:
+                    sql_payg = unaccounted
+                elif has_premium_os:
+                    hidden_os_payg = unaccounted
+
+            comp_payg = pure_comp_payg + hidden_os_payg
+
             if is_spot:
                 comp_ri1 = comp_payg
                 comp_ri3 = comp_payg
             else:
                 if usd_ri1 > 0:
-                    comp_ri1 = (usd_ri1 * locked_fx) + prem_os_payg
+                    comp_ri1 = (usd_ri1 * locked_fx) + hidden_os_payg
                 else:
-                    comp_ri1 = max(0, orig_ri1 - license_total)
+                    comp_ri1 = max(0, orig_ri1 - win_payg - sql_payg)
                     
                 if usd_ri3 > 0:
-                    comp_ri3 = (usd_ri3 * locked_fx) + prem_os_payg
+                    comp_ri3 = (usd_ri3 * locked_fx) + hidden_os_payg
                 else:
-                    comp_ri3 = max(0, orig_ri3 - license_total)
+                    comp_ri3 = max(0, orig_ri3 - win_payg - sql_payg)
 
             row["api"] = {
                 "compute_payg_final": comp_payg,
                 "win_lic_payg_final": win_payg,
-                "prem_os_payg_final": prem_os_payg,
+                "prem_os_payg_final": 0, # Folded directly into compute 
                 "sql_payg_final": sql_payg,
                 "compute_ri1": comp_ri1,
                 "compute_ri3": comp_ri3
@@ -413,7 +418,6 @@ def write_vm_sheet(wb, rows, currency):
 
         comp_payg = p.get("compute_payg_final", row.get("payg",0))
         win_payg  = p.get("win_lic_payg_final", 0)
-        prem_os_payg = p.get("prem_os_payg_final", 0)
         sql_payg  = p.get("sql_payg_final", 0)
         
         comp_ri1  = p.get("compute_ri1", comp_payg)
@@ -424,17 +428,12 @@ def write_vm_sheet(wb, rows, currency):
         ri += 1
 
         if win_payg > 0:
-            sub = ["","","","","Windows License", win_payg, win_payg, win_payg, "License Cost (Not discounted)"]
-            for ci, v in enumerate(sub, 1): dat(ws.cell(ri, ci), v, currency, italic=True, color="595959", align="right" if ci>=6 and isinstance(v,float) else "left")
-            ri += 1
-
-        if prem_os_payg > 0:
-            sub = ["","","","", row.get("os_lbl_exact", "Premium OS License"), prem_os_payg, prem_os_payg, prem_os_payg, "License Cost (Not discounted)"]
+            sub = ["","","","","Windows License", win_payg, win_payg, win_payg, "License Cost (Not discounted by Compute RI)"]
             for ci, v in enumerate(sub, 1): dat(ws.cell(ri, ci), v, currency, italic=True, color="595959", align="right" if ci>=6 and isinstance(v,float) else "left")
             ri += 1
 
         if sql_payg > 0:
-            sub = ["","","","", row.get("sql_lbl_exact", "SQL License"), sql_payg, sql_payg, sql_payg, "License Cost (Not discounted)"]
+            sub = ["","","","", row.get("sql_lbl_exact", "SQL License"), sql_payg, sql_payg, sql_payg, "License Cost (Not discounted by Compute RI)"]
             for ci, v in enumerate(sub, 1): dat(ws.cell(ri, ci), v, currency, italic=True, color="595959", align="right" if ci>=6 and isinstance(v,float) else "left")
             ri += 1
 
@@ -499,6 +498,7 @@ def convert(input_path, output_path, currency="INR"):
     rows = parse_all_formats(wb_in)
     
     if not rows:
+        wb_in.close()
         raise ValueError("No data rows found. Ensure this is an unmodified Azure Pricing Calculator export.")
 
     buckets = classify(rows)
@@ -517,7 +517,11 @@ def convert(input_path, output_path, currency="INR"):
             totals[sname] = write_generic_sheet(wb_out, sname, buckets[sname], currency)
 
     write_summary(wb_out, totals, currency)
+    
+    # EXTREMELY CRITICAL: These must be explicitly closed to clear Azure's read/write locks, preventing 409 errors
     wb_out.save(output_path)
+    wb_in.close()
+    wb_out.close()
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

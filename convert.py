@@ -39,7 +39,7 @@ def hdr(c, v, wrap=False):
 def dat(c, v, currency, bold=False, italic=False, align="left", color="000000"):
     c.value=v; c.font=_f(bold,italic,color=color)
     c.alignment=_al(align,"center",True); c.border=BORDER
-    if isinstance(v, (int, float)) and align=="right":
+    if (isinstance(v, (int, float)) or (isinstance(v, str) and v.startswith("="))) and align=="right":
         c.number_format = get_num_fmt(currency)
 
 def tot(c, v, currency):
@@ -110,7 +110,6 @@ def get_exact_license_name(desc):
     parts = re.split(r'[,;]', desc)
     sql_name = os_name = None
     
-    # [H4] BYOL / AHB Detection
     is_ahb = any(kw in desc_l for kw in ["hybrid benefit", "ahb", "bring your own license", "byol"])
     
     prem_kws = ["red hat", "rhel", "suse", "sles", "ubuntu pro", "ubuntu advantage"]
@@ -127,13 +126,9 @@ def get_exact_license_name(desc):
     return sql_name, os_name, os_type, is_ahb
 
 def get_safe_sku_fallbacks(sku):
-    """[H2] Regex fallback to avoid corrupting M-series and complex SKUs."""
     fallbacks = []
-    # Safe S-removal: Standard_D4s_v3 -> Standard_D4_v3
     f1 = re.sub(r'(?i)s(_v\d+)$', r'\1', sku)
     if f1 != sku: fallbacks.append(f1)
-    
-    # DS to D: Standard_DS1_v2 -> Standard_D1_v2
     f2 = re.sub(r'(?i)ds(\d+_v\d+)$', r'd\1', sku)
     if f2 != sku: fallbacks.append(f2)
     return fallbacks
@@ -142,19 +137,25 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
     region = arm_region(region_display)
     
     def fetch(s, ptype):
-        # [Medium] Strict filtering ensures we only get VM Compute/Software, not odd extraneous meters
         filt = f"armSkuName eq '{s}' and armRegionName eq '{region}' and priceType eq '{ptype}' and serviceName eq 'Virtual Machines'"
         return _api(session, cache, filt, currency)
 
-    payg_items = fetch(sku, "Consumption")
+    def get_items(s, ptype):
+        items = fetch(s, ptype)
+        if items: return items
+        for fallback in get_safe_sku_fallbacks(s):
+            items = fetch(fallback, ptype)
+            if items: return items
+        return []
+
+    payg_items = get_items(sku, "Consumption")
+    ri_items = get_items(sku, "Reservation")
+    
     if not payg_items:
-        # Fallback to stripped core count (e.g., E16-4as_v5 -> E16as_v5)
         base_sku = re.sub(r'-\d+', '', sku)
-        payg_items = fetch(base_sku, "Consumption")
-        if not payg_items:
-            for fallback in get_safe_sku_fallbacks(base_sku):
-                payg_items = fetch(fallback, "Consumption")
-                if payg_items: break
+        if base_sku != sku:
+            payg_items = get_items(base_sku, "Consumption")
+            ri_items = get_items(base_sku, "Reservation")
 
     def _get_price(items, must_be_win=False):
         cands = []
@@ -173,10 +174,23 @@ def get_vm_pricing(session, cache, sku, region_display, is_spot, currency="INR")
     linux_hr = _get_price(payg_items, must_be_win=False)
     win_hr   = _get_price(payg_items, must_be_win=True)
 
-    return {
+    result = {
         "compute_payg": _hourly_to_monthly(linux_hr) if linux_hr else None,
-        "windows_tot": _hourly_to_monthly(win_hr) if win_hr else None
+        "windows_tot": _hourly_to_monthly(win_hr) if win_hr else None,
+        "compute_ri1": None,
+        "compute_ri3": None
     }
+
+    if not is_spot:
+        ri1_cands = [i for i in ri_items if i.get("reservationTerm") == "1 Year"]
+        ri1_val = _get_price(ri1_cands, must_be_win=False)
+        if ri1_val is not None: result["compute_ri1"] = ri1_val / 12
+
+        ri3_cands = [i for i in ri_items if i.get("reservationTerm") == "3 Years"]
+        ri3_val = _get_price(ri3_cands, must_be_win=False)
+        if ri3_val is not None: result["compute_ri3"] = ri3_val / 36
+
+    return result
 
 def extract_vm_sku(desc):
     if not desc: return None
@@ -191,7 +205,7 @@ def extract_quantity(desc):
     m = re.match(r'^\s*([0-9,]+)\s+', desc)
     return max(1, int(m.group(1).replace(',', ''))) if m else 1
 
-# ── Universal Parsing [C2 Fix] ──────────────────────────────────────────────
+# ── Parsing ──────────────────────────────────────────────────────────────────
 def parse_all_formats(wb):
     rows = []
     for sname in wb.sheetnames:
@@ -244,8 +258,29 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
     session = get_http_session()
     cache = {}
 
+    locked_fx = 1.0
+    if currency != "USD":
+        for row in vm_rows:
+            desc = row["desc"]
+            sku = extract_vm_sku(desc)
+            sql_lbl, _, _, is_ahb = get_exact_license_name(desc)
+            prem_kws = ["red hat", "rhel", "suse", "sles", "ubuntu pro", "ubuntu advantage"]
+            has_prem = any(kw in desc.lower() for kw in prem_kws)
+            
+            if sku and not has_prem and not sql_lbl:
+                qty = extract_quantity(desc)
+                p_usd = get_vm_pricing(session, cache, sku, row["region"], "spot" in desc.lower(), "USD")
+                usd_comp = (p_usd.get("compute_payg") or 0) * qty
+                usd_win = (p_usd.get("windows_tot") or 0) * qty if detect_os(desc) == "Windows" and not is_ahb else 0
+                usd_tot = usd_comp + usd_win
+                orig_payg = row.get("payg", 0)
+                
+                if usd_tot > 0 and orig_payg > 0:
+                    locked_fx = orig_payg / usd_tot
+                    break
+
     def process_row(row):
-        try: # [C1] Safely contain all worker exceptions
+        try: 
             desc, region = row["desc"], row["region"]
             qty = extract_quantity(desc)
             sku = extract_vm_sku(desc)
@@ -269,51 +304,62 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
                 row["remarks"] = " | ".join(remarks)
                 return row
 
-            # [C3 & Medium] Query Native Target Currency. No USD reverse engineering.
-            p_api = get_vm_pricing(session, cache, sku, region, is_spot, currency)
-            api_comp = (p_api.get("compute_payg") or 0) * qty
-            api_win  = (p_api.get("windows_tot") or 0) * qty
-            orig_payg = row.get("payg", 0)
+            p_usd = get_vm_pricing(session, cache, sku, region, is_spot, "USD")
+            usd_comp = (p_usd.get("compute_payg") or 0) * qty
+            usd_win  = (p_usd.get("windows_tot") or 0) * qty
+            usd_ri1  = (p_usd.get("compute_ri1") or 0) * qty
+            usd_ri3  = (p_usd.get("compute_ri3") or 0) * qty
 
-            if api_comp == 0:
+            orig_payg = row.get("payg", 0)
+            orig_ri1, orig_ri3 = row.get("ri1", orig_payg), row.get("ri3", orig_payg)
+
+            if usd_comp == 0:
                 remarks.append("API Lookup Failed - Using Raw Values")
-                row["api"] = {"compute_payg_final": orig_payg, "win_lic_payg_final": 0, "prem_os_payg_final": 0, "sql_payg_final": 0}
+                row["api"] = {
+                    "compute_payg_final": orig_payg, "win_lic_payg_final": 0, 
+                    "prem_os_payg_final": 0, "sql_payg_final": 0,
+                    "compute_ri1": orig_ri1, "compute_ri3": orig_ri3
+                }
                 row["remarks"] = " | ".join(remarks)
                 return row
 
             comp_payg, win_payg, prem_os_payg, sql_payg = orig_payg, 0, 0, 0
 
             # --- PROPORTIONAL FX SPLIT ENGINE ---
-            if os_type == "Windows" and not is_ahb and api_win > api_comp:
-                win_ratio = (api_win - api_comp) / api_win
+            if os_type == "Windows" and not is_ahb and usd_win > 0:
+                win_ratio = usd_win / (usd_comp + usd_win)
                 win_payg = orig_payg * win_ratio
                 comp_payg = orig_payg - win_payg
-
             elif has_premium_os:
-                if orig_payg > api_comp:
-                    prem_os_payg = orig_payg - api_comp
-                    comp_payg = api_comp
-                else:
-                    # EA Discount safety fallback
-                    prem_os_payg = orig_payg * 0.20
-                    comp_payg = orig_payg * 0.80
-
+                comp_payg = usd_comp * locked_fx
+                prem_os_payg = max(0, orig_payg - comp_payg)
+                # Visual Merge
+                comp_payg += prem_os_payg
+                prem_os_payg = 0 
+            
             if has_sql:
-                # Deduce SQL from remainder
                 if orig_payg > (comp_payg + win_payg + prem_os_payg):
                     sql_payg = orig_payg - (comp_payg + win_payg + prem_os_payg)
                 else:
                     sql_payg = orig_payg * 0.40
                     comp_payg = orig_payg * 0.60
-                    prem_os_payg = 0
 
-            # The exact, pristine license cost
             license_total = win_payg + prem_os_payg + sql_payg
             
-            # Reserved Instance Logic: Calculate from raw Excel RI totals
-            orig_ri1, orig_ri3 = row.get("ri1", orig_payg), row.get("ri3", orig_payg)
-            comp_ri1 = max(0, orig_ri1 - license_total) if not is_spot else comp_payg
-            comp_ri3 = max(0, orig_ri3 - license_total) if not is_spot else comp_payg
+            # --- FLAWLESS RI COMPUTATION ---
+            if is_spot:
+                comp_ri1 = comp_payg
+                comp_ri3 = comp_payg
+            else:
+                if usd_ri1 > 0:
+                    comp_ri1 = (usd_ri1 * locked_fx) + prem_os_payg
+                else:
+                    comp_ri1 = max(0, orig_ri1 - license_total)
+                    
+                if usd_ri3 > 0:
+                    comp_ri3 = (usd_ri3 * locked_fx) + prem_os_payg
+                else:
+                    comp_ri3 = max(0, orig_ri3 - license_total)
 
             row["api"] = {
                 "compute_payg_final": comp_payg,
@@ -335,14 +381,12 @@ def enrich_vms_concurrent(vm_rows, currency="INR"):
     with ThreadPoolExecutor(max_workers=min(20, len(vm_rows))) as executor:
         futures = {executor.submit(process_row, r): r for r in vm_rows}
         for future in as_completed(futures):
-            try:
-                future.result() # [C1 Fix] Bubble up catastrophic thread pool failures
-            except Exception as e:
-                log.error(f"Pool Exception: {e}")
+            try: future.result() 
+            except Exception as e: log.error(f"Pool Exception: {e}")
 
     return vm_rows
 
-# ── Output ────────────────────────────────────────────────────────────────
+# ── Output ───────────────────────────────────────────────────────────────────
 def write_res_header(ws):
     ws.merge_cells("F1:H1")
     hdr(ws["F1"], "Monthly Cost")
@@ -369,13 +413,12 @@ def write_vm_sheet(wb, rows, currency):
 
         comp_payg = p.get("compute_payg_final", row.get("payg",0))
         win_payg  = p.get("win_lic_payg_final", 0)
-        prem_os_payg = p.get("prem_os_payg_final", 0) # [H1 Fix] Restored Premium OS display
+        prem_os_payg = p.get("prem_os_payg_final", 0)
         sql_payg  = p.get("sql_payg_final", 0)
         
         comp_ri1  = p.get("compute_ri1", comp_payg)
         comp_ri3  = p.get("compute_ri3", comp_payg)
 
-        # Base Compute Row
         vals = [row["svc_cat"], row["svc_type"], row["cust_name"], row["region"], row["desc"], comp_payg, comp_ri1, comp_ri3, row.get("remarks","")]
         for ci, v in enumerate(vals, 1): dat(ws.cell(ri, ci), v, currency, align="right" if ci>=6 and isinstance(v,float) else "left")
         ri += 1
@@ -395,11 +438,11 @@ def write_vm_sheet(wb, rows, currency):
             for ci, v in enumerate(sub, 1): dat(ws.cell(ri, ci), v, currency, italic=True, color="595959", align="right" if ci>=6 and isinstance(v,float) else "left")
             ri += 1
 
-    # Native Excel Formulas [Medium Fix]
     ws.cell(ri, 5, "Total").font = _f(bold=True)
     ws.cell(ri, 5).border = BORDER
     for ci, col_let in [(6, 'F'), (7, 'G'), (8, 'H')]:
         tot(ws.cell(ri, ci), f"=SUM({col_let}3:{col_let}{ri-1})", currency)
+    return ri
 
 def write_generic_sheet(wb, sheet_name, rows, currency):
     ws = wb.create_sheet(sheet_name)
@@ -418,6 +461,38 @@ def write_generic_sheet(wb, sheet_name, rows, currency):
     ws.cell(ri, 5).border = BORDER
     for ci, col_let in [(6, 'F'), (7, 'G'), (8, 'H')]:
         tot(ws.cell(ri, ci), f"=SUM({col_let}3:{col_let}{ri-1})", currency)
+    return ri
+
+def write_summary(wb, totals, currency):
+    ws = wb.create_sheet("Summary", 0)
+    ws.merge_cells("A1:A2"); ws.merge_cells("B1:B2"); ws.merge_cells("C1:E1"); ws.merge_cells("F1:F2")
+    
+    for addr, val, al in [("A1","Sl No","left"),("B1","Service Name","left"), ("C1","Monthly Cost","center"),("F1","Remarks","left")]:
+        c=ws[addr]; c.value=val; c.font=_f(bold=True); c.alignment=_al(al,"center"); c.border=BORDER
+    for addr, val in [("C2","PAYG"),("D2","1 YR RI Model"),("E2","3 YR RI Model")]:
+        c=ws[addr]; c.value=val; c.font=_f(bold=True); c.alignment=_al("center","center"); c.border=BORDER
+
+    ri = 3
+    for sl, (sname, tot_row) in enumerate(totals.items(), 1):
+        c=ws.cell(ri,1,sl); c.border=BORDER; c.alignment=_al("center")
+        c=ws.cell(ri,2,sname); c.border=BORDER
+        
+        dat(ws.cell(ri, 3), f"='{sname}'!F{tot_row}", currency, align="right")
+        dat(ws.cell(ri, 4), f"='{sname}'!G{tot_row}", currency, align="right")
+        dat(ws.cell(ri, 5), f"='{sname}'!H{tot_row}", currency, align="right")
+        ws.cell(ri,6).border=BORDER
+        ri += 1
+
+    ws.cell(ri, 2, "Total").font = _f(bold=True)
+    ws.cell(ri, 2).border = BORDER
+    ws.cell(ri, 1).border = BORDER
+    ws.cell(ri, 6).border = BORDER
+    
+    tot(ws.cell(ri, 3), f"=SUM(C3:C{ri-1})", currency)
+    tot(ws.cell(ri, 4), f"=SUM(D3:D{ri-1})", currency)
+    tot(ws.cell(ri, 5), f"=SUM(E3:E{ri-1})", currency)
+
+    widths(ws, {"A":5.5, "B":22, "C":14, "D":14, "E":14, "F":48})
 
 def convert(input_path, output_path, currency="INR"):
     wb_in = load_workbook(input_path, data_only=True)
@@ -432,16 +507,16 @@ def convert(input_path, output_path, currency="INR"):
 
     wb_out = Workbook()
     wb_out.remove(wb_out.active)
+    totals = {}
 
-    # Note: We rely on the Excel formulas for the Summary sheet in a real system, 
-    # but for simplicity of this script, we can inject a quick standard sheet.
     for sname in SHEET_ORDER:
         if sname not in buckets: continue
         if sname == "Virtual Machines":
-            write_vm_sheet(wb_out, buckets[sname], currency)
+            totals[sname] = write_vm_sheet(wb_out, buckets[sname], currency)
         else:
-            write_generic_sheet(wb_out, sname, buckets[sname], currency)
+            totals[sname] = write_generic_sheet(wb_out, sname, buckets[sname], currency)
 
+    write_summary(wb_out, totals, currency)
     wb_out.save(output_path)
 
 if __name__ == "__main__":
